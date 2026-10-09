@@ -1,0 +1,4 @@
+Retina 0.2.3
+C++ standard: C++20
+Platform baseline tested here: Linux x86_64
+Source status: recreated from the recovered Retina source plus documented 0.2.x hardening/remote-Git behavior; not a byte-for-byte source recovery of the historical binary.
