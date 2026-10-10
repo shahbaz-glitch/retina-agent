@@ -1,4 +1,4 @@
-name: Retina CI and Windows Runtime
+name: Retina Windows CI and Runtime
 
 on:
   push:
@@ -11,68 +11,54 @@ permissions:
   contents: read
 
 concurrency:
-  group: retina-ci-${{ github.ref }}
+  group: retina-windows-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  linux-build-and-test:
-    name: Linux build and integration tests
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v7
-
-      - name: Install build and runtime tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
-            build-essential cmake ninja-build git clangd ugrep \
-            libboost-process-dev libboost-json-dev
-
-      - name: Show tool versions
-        run: |
-          cmake --version
-          c++ --version
-          clangd --version
-          ugrep --version
-          git --version
-
-      - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build
-        run: cmake --build build --parallel
-
-      - name: Run full integration test suite
-        run: ctest --test-dir build --output-on-failure
-
-      - name: Smoke test executable
-        run: ./build/retina-agent --help
-
-      - name: Upload Linux executable
-        uses: actions/upload-artifact@v7.0.2
-        with:
-          name: retina-agent-linux-x86_64
-          path: build/retina-agent
-          if-no-files-found: error
-          retention-days: 14
-
   windows-build-and-package:
-    name: Windows x64 build and runtime package
+    name: Windows x64 build, tests and runtime ZIP
     runs-on: windows-2025
     timeout-minutes: 45
+
     steps:
       - name: Check out source
         uses: actions/checkout@v7
 
-      - name: Install Boost headers through vcpkg
+      - name: Set up MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Download and verify Boost 1.85.0
         shell: pwsh
         run: |
-          $vcpkg = $env:VCPKG_INSTALLATION_ROOT
-          if (-not $vcpkg) { throw 'VCPKG_INSTALLATION_ROOT is not set on this runner.' }
-          & (Join-Path $vcpkg 'vcpkg.exe') install boost-process boost-json --triplet x64-windows
-          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed with exit code $LASTEXITCODE" }
+          $version = '1.85.0'
+          $zip = Join-Path $env:RUNNER_TEMP 'boost_1_85_0.zip'
+          $root = Join-Path $env:RUNNER_TEMP 'boost_1_85_0'
+
+          $url = "https://archives.boost.io/release/$version/source/boost_1_85_0.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+
+          $expected = 'e712fe7eb1b9ec37ac25102525412fb4d74e638996443944025791f48f29408a'
+          $actual = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          if ($actual -ne $expected) {
+            throw "Boost SHA-256 verification failed: $actual"
+          }
+
+          Expand-Archive -LiteralPath $zip `
+            -DestinationPath $env:RUNNER_TEMP -Force
+
+          if (-not (Test-Path (Join-Path $root 'boost/process.hpp'))) {
+            throw 'Boost.Process header not found in verified Boost archive.'
+          }
+
+          if (-not (Test-Path (Join-Path $root 'boost/json.hpp'))) {
+            throw 'Boost.JSON header not found in verified Boost archive.'
+          }
+
+          "RETINA_BOOST_ROOT=$root" |
+            Add-Content -Path $env:GITHUB_ENV
 
       - name: Download and verify ugrep
         shell: pwsh
@@ -81,48 +67,89 @@ jobs:
           $url = "https://github.com/Genivia/ugrep/releases/download/v$version/ugrep-windows-x64.zip"
           $zip = Join-Path $env:RUNNER_TEMP 'ugrep-windows-x64.zip'
           $extract = Join-Path $env:RUNNER_TEMP 'ugrep-extracted'
+
           Invoke-WebRequest -Uri $url -OutFile $zip
+
           $expected = '4887e305ff06e5510ee4e3c7da8b7928b59042b379717027aea1aec19b28204f'
           $actual = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actual -ne $expected) { throw "ugrep SHA-256 mismatch: $actual" }
-          Expand-Archive -Path $zip -DestinationPath $extract -Force
-          $exe = Get-ChildItem -Path $extract -Filter 'ugrep.exe' -Recurse | Select-Object -First 1
-          if (-not $exe) { throw 'ugrep.exe was not found in the verified release archive.' }
+
+          if ($actual -ne $expected) {
+            throw "ugrep SHA-256 verification failed: $actual"
+          }
+
+          Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+
+          $exe = Get-ChildItem -Path $extract -Filter 'ugrep.exe' -Recurse |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            throw 'ugrep.exe not found in verified archive.'
+          }
+
           Add-Content -Path $env:GITHUB_PATH -Value $exe.Directory.FullName
           Add-Content -Path $env:GITHUB_ENV -Value "RETINA_UGREP=$($exe.FullName)"
 
-      - name: Check Windows toolchain
+      - name: Locate Windows runtime tools
         shell: pwsh
         run: |
-          cmake --version
-          clangd --version
-          git --version
-          ugrep --version
-          ninja --version
+          $clangd = (Get-Command clangd.exe -ErrorAction Stop).Source
+          $git = (Get-Command git.exe -ErrorAction Stop).Source
 
-      - name: Configure Windows build
+          "RETINA_CLANGD=$clangd" |
+            Add-Content -Path $env:GITHUB_ENV
+
+          "RETINA_GIT=$git" |
+            Add-Content -Path $env:GITHUB_ENV
+
+          cmake --version
+          cl
+          ninja --version
+          & $clangd --version
+          & $git --version
+          & $env:RETINA_UGREP --version
+
+      - name: Configure Windows x64 build
         shell: pwsh
         run: |
-          $toolchain = Join-Path $env:VCPKG_INSTALLATION_ROOT 'scripts/buildsystems/vcpkg.cmake'
           cmake -S . -B build -G Ninja `
-            "-DCMAKE_TOOLCHAIN_FILE=$toolchain" `
-            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DCMAKE_CXX_COMPILER=cl.exe `
+            "-DBOOST_INCLUDE_DIR=$env:RETINA_BOOST_ROOT" `
+            "-DBOOST_JSON_INCLUDE_DIR=$env:RETINA_BOOST_ROOT" `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
             -DCMAKE_BUILD_TYPE=Release
-          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed with exit code $LASTEXITCODE" }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake configure failed: $LASTEXITCODE"
+          }
 
       - name: Build Windows targets
         shell: pwsh
         run: |
           cmake --build build --parallel
-          if ($LASTEXITCODE -ne 0) { throw "Windows build failed with exit code $LASTEXITCODE" }
 
-      - name: Smoke test Windows executable
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows build failed: $LASTEXITCODE"
+          }
+
+      - name: Run integration tests
+        shell: pwsh
+        run: |
+          ctest --test-dir build --output-on-failure
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows integration tests failed: $LASTEXITCODE"
+          }
+
+      - name: Smoke test executable
         shell: pwsh
         run: |
           .\build\retina-agent.exe --help
-          if ($LASTEXITCODE -ne 0) { throw "Windows smoke test failed with exit code $LASTEXITCODE" }
 
-      - name: Assemble runtime-only folder
+          if ($LASTEXITCODE -ne 0) {
+            throw "Retina executable smoke test failed: $LASTEXITCODE"
+          }
+
+      - name: Assemble Windows runtime-only package
         shell: pwsh
         run: |
           $dist = Join-Path $env:RUNNER_TEMP 'Retina-0.2.3-windows-x64-runtime'
@@ -130,35 +157,76 @@ jobs:
           $ugrepDir = Join-Path $tools 'ugrep'
           $clangdDir = Join-Path $tools 'clangd'
           $gitDir = Join-Path $tools 'git'
-          New-Item -ItemType Directory -Force -Path $ugrepDir, (Join-Path $clangdDir 'bin'), $gitDir | Out-Null
 
-          Copy-Item '.\build\retina-agent.exe' (Join-Path $dist 'retina-agent.exe') -Force
+          New-Item -ItemType Directory -Force -Path `
+            $ugrepDir, `
+            (Join-Path $clangdDir 'bin'), `
+            $gitDir | Out-Null
 
-          # Copy the verified ugrep distribution, not source/build files.
-          $ugrepExe = Get-ChildItem -Path (Join-Path $env:RUNNER_TEMP 'ugrep-extracted') -Filter 'ugrep.exe' -Recurse | Select-Object -First 1
-          if (-not $ugrepExe) { throw 'Could not locate verified ugrep.exe for packaging.' }
-          Copy-Item (Join-Path $ugrepExe.Directory.FullName '*') $ugrepDir -Recurse -Force
+          Copy-Item '.\build\retina-agent.exe' `
+            (Join-Path $dist 'retina-agent.exe') -Force
 
-          # Bundle clangd, its adjacent DLLs, and Clang resource headers.
-          $clangdExe = (Get-Command clangd.exe -ErrorAction Stop).Source
+          # Copy the verified ugrep distribution.
+          $ugrepExe = Get-ChildItem `
+            -Path (Join-Path $env:RUNNER_TEMP 'ugrep-extracted') `
+            -Filter 'ugrep.exe' -Recurse |
+            Select-Object -First 1
+
+          if (-not $ugrepExe) {
+            throw 'Verified ugrep.exe is missing.'
+          }
+
+          Copy-Item `
+            (Join-Path $ugrepExe.Directory.FullName '*') `
+            $ugrepDir -Recurse -Force
+
+          # Bundle clangd, adjacent DLLs and Clang resource headers.
+          $clangdExe = $env:RETINA_CLANGD
           $llvmBin = Split-Path $clangdExe -Parent
           $llvmRoot = Split-Path $llvmBin -Parent
-          Copy-Item $clangdExe (Join-Path $clangdDir 'bin\clangd.exe') -Force
-          Get-ChildItem -Path $llvmBin -Filter '*.dll' -File | ForEach-Object { Copy-Item $_.FullName -Destination (Join-Path $clangdDir 'bin') -Force }
-          $resourceSource = Join-Path $llvmRoot 'lib\clang'
-          if (-not (Test-Path $resourceSource)) { throw "Clang resource directory missing: $resourceSource" }
-          $resourceDest = Join-Path $clangdDir 'lib\clang'
-          New-Item -ItemType Directory -Force -Path $resourceDest | Out-Null
-          Copy-Item (Join-Path $resourceSource '*') $resourceDest -Recurse -Force
+          $clangdBin = Join-Path $clangdDir 'bin'
 
-          # Bundle the complete Git for Windows directory so git.exe keeps its DLLs,
-          # libexec helpers, templates, and support files alongside it.
-          $gitExe = (Get-Command git.exe -ErrorAction Stop).Source
-          $gitRoot = Split-Path (Split-Path $gitExe -Parent) -Parent
-          robocopy $gitRoot $gitDir /E /NFL /NDL /NJH /NJS /NP | Out-Null
-          if ($LASTEXITCODE -ge 8) { throw "Could not copy Git for Windows (robocopy exit code $LASTEXITCODE)." }
+          Copy-Item $clangdExe `
+            (Join-Path $clangdBin 'clangd.exe') -Force
+
+          Get-ChildItem -Path $llvmBin -Filter '*.dll' -File |
+            ForEach-Object {
+              Copy-Item $_.FullName -Destination $clangdBin -Force
+            }
+
+          $resourceSource = Join-Path $llvmRoot 'lib\clang'
+
+          if (-not (Test-Path $resourceSource)) {
+            throw "Clang resource headers missing: $resourceSource"
+          }
+
+          $resourceDest = Join-Path $clangdDir 'lib\clang'
+          New-Item -ItemType Directory -Force -Path $resourceDest |
+            Out-Null
+
+          Copy-Item (Join-Path $resourceSource '*') `
+            $resourceDest -Recurse -Force
+
+          # Copy Git for Windows with its required support files.
+          $gitExe = $env:RETINA_GIT
+          $gitCmdDir = Split-Path $gitExe -Parent
+
+          if ((Split-Path $gitCmdDir -Leaf) -ne 'cmd') {
+            throw "Unexpected Git installation layout: $gitExe"
+          }
+
+          $gitRoot = Split-Path $gitCmdDir -Parent
+
+          robocopy $gitRoot $gitDir /E /NFL /NDL /NJH /NJS /NP |
+            Out-Null
+
+          if ($LASTEXITCODE -ge 8) {
+            throw "Git copy failed: robocopy exit code $LASTEXITCODE"
+          }
+
           $global:LASTEXITCODE = 0
 
+          # Create a launcher using the bundled executables.
           $launcher = @'
           @echo off
           setlocal
@@ -169,37 +237,55 @@ jobs:
           "%~dp0retina-agent.exe" %*
           exit /b %ERRORLEVEL%
           '@
-          $launcher | Set-Content -Path (Join-Path $dist 'Retina.bat') -Encoding ASCII
 
-          $ugrepVersion = (& (Join-Path $ugrepDir 'ugrep.exe') --version | Select-Object -First 1)
-          $clangdVersion = (& (Join-Path $clangdDir 'bin\clangd.exe') --version | Select-Object -First 1)
+          $launcher |
+            Set-Content -Path (Join-Path $dist 'Retina.bat') -Encoding ASCII
+
+          $ugrepVersion = (& (Join-Path $ugrepDir 'ugrep.exe') --version |
+            Select-Object -First 1)
+
+          $clangdVersion = (& (Join-Path $clangdBin 'clangd.exe') --version |
+            Select-Object -First 1)
+
           $gitVersion = (& (Join-Path $gitDir 'cmd\git.exe') --version)
+
           @(
-            'Retina 0.2.3 — Windows x64 runtime-only package'
-            'Includes the Retina executable and runtime tools; source, tests, CMake, and build intermediates are excluded.'
+            'Retina 0.2.3 - Windows x64 runtime-only package'
+            'Source, tests, CMake and build intermediates are excluded.'
             "ugrep: $ugrepVersion"
             "clangd: $clangdVersion"
             "Git: $gitVersion"
-            'Launch Retina.bat to use the bundled tool paths.'
+            'Run Retina.bat to use the bundled tools.'
           ) | Set-Content -Path (Join-Path $dist 'RUNTIME-INFO.txt') -Encoding UTF8
 
-          # Validate the copied tools and launcher before creating the package.
+          # Smoke-test the tools in the package.
           & (Join-Path $ugrepDir 'ugrep.exe') --version | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw 'Bundled ugrep smoke test failed.' }
-          & (Join-Path $clangdDir 'bin\clangd.exe') --version | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw 'Bundled clangd smoke test failed.' }
+          if ($LASTEXITCODE -ne 0) { throw 'Bundled ugrep check failed.' }
+
+          & (Join-Path $clangdBin 'clangd.exe') --version | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Bundled clangd check failed.' }
+
           & (Join-Path $gitDir 'cmd\git.exe') --version | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw 'Bundled Git smoke test failed.' }
+          if ($LASTEXITCODE -ne 0) { throw 'Bundled Git check failed.' }
+
           cmd.exe /d /c "`"$dist\Retina.bat`" --help"
-          if ($LASTEXITCODE -ne 0) { throw 'Packaged Retina launcher smoke test failed.' }
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Packaged Retina launcher check failed.'
+          }
 
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
           $archive = Join-Path $env:RUNNER_TEMP 'Retina-0.2.3-windows-x64-runtime.zip'
-          if (Test-Path $archive) { Remove-Item $archive -Force }
-          [System.IO.Compression.ZipFile]::CreateFromDirectory($dist, $archive, [System.IO.Compression.CompressionLevel]::Optimal, $false)
-          "RETINA_RUNTIME_ZIP=$archive" | Set-Content -Path $env:GITHUB_ENV -Append
 
-      - name: Upload Windows runtime-only package
+          if (Test-Path $archive) {
+            Remove-Item $archive -Force
+          }
+
+          Compress-Archive -Path (Join-Path $dist '*') `
+            -DestinationPath $archive -CompressionLevel Optimal
+
+          "RETINA_RUNTIME_ZIP=$archive" |
+            Add-Content -Path $env:GITHUB_ENV
+
+      - name: Upload Windows runtime-only ZIP
         uses: actions/upload-artifact@v7.0.2
         with:
           name: retina-0.2.3-windows-x64-runtime
