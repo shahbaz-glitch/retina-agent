@@ -1,4 +1,4 @@
-name: Retina CI
+name: Retina Windows CI
 
 on:
   push:
@@ -9,20 +9,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: retina-ci-${{ github.workflow }}-${{ github.ref }}
+  group: retina-windows-ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build-test-install:
-    name: Build, test and install (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Build, test and install (Windows x64)
+    runs-on: windows-latest
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
     env:
       CMAKE_GENERATOR: Ninja
       CMAKE_BUILD_TYPE: Release
@@ -32,13 +26,11 @@ jobs:
         uses: actions/checkout@v7.0.1
 
       - name: Set up MSVC environment
-        if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      - name: Install Windows tools
-        if: runner.os == 'Windows'
+      - name: Install Windows tools and Boost
         shell: pwsh
         run: |
           choco install ninja ugrep llvm --yes --no-progress
@@ -47,25 +39,23 @@ jobs:
             throw 'VCPKG_INSTALLATION_ROOT is not configured on this runner.'
           }
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install boost-process boost-json --triplet x64-windows
-
-      - name: Install Ubuntu tools and Boost headers
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes build-essential cmake ninja-build git ugrep clangd libboost-all-dev
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify required tools
-        shell: bash
+        shell: pwsh
         run: |
           cmake --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ninja --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ugrep --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           clangd --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Configure (Windows)
-        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $toolchain = Join-Path $env:VCPKG_INSTALLATION_ROOT 'scripts/buildsystems/vcpkg.cmake'
@@ -75,40 +65,37 @@ jobs:
             -DVCPKG_TARGET_TRIPLET=x64-windows
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Configure (Ubuntu)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-
       - name: Build
-        run: cmake --build build --parallel
+        shell: pwsh
+        run: |
+          cmake --build build --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run integration and adversarial tests
-        run: ctest --test-dir build --output-on-failure
+        shell: pwsh
+        run: |
+          ctest --test-dir build --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Install runtime to staging directory
-        run: cmake --install build --prefix install-root
+        shell: pwsh
+        run: |
+          cmake --install build --prefix install-root
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Verify installed executable (Windows)
-        if: runner.os == 'Windows'
+      - name: Verify installed executable
         shell: pwsh
         run: |
           if (-not (Test-Path 'install-root/bin/retina-agent.exe')) {
             throw 'Installed Retina executable is missing.'
           }
           & 'install-root/bin/retina-agent.exe' --help
-
-      - name: Verify installed executable (Ubuntu)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          test -x install-root/bin/retina-agent
-          install-root/bin/retina-agent --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload installed runtime
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: retina-runtime-${{ runner.os }}-x64
+          name: retina-runtime-windows-x64
           path: install-root/
           if-no-files-found: error
           retention-days: 14
