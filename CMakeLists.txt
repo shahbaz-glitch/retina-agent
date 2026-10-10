@@ -19,6 +19,16 @@ target_include_directories(retina_core PUBLIC include ${BOOST_INCLUDE_DIR} ${BOO
 target_compile_features(retina_core PUBLIC cxx_std_20)
 target_compile_definitions(retina_core PUBLIC BOOST_JSON_HEADER_ONLY)
 
+if(WIN32)
+    # Boost.JSON is compiled into src/json.cpp via <boost/json/src.hpp>.
+    # Disable MSVC's auto-linking to prebuilt Boost libraries.
+    target_compile_definitions(retina_core PUBLIC
+        BOOST_JSON_NO_LIB
+        BOOST_CONTAINER_NO_LIB
+        _WIN32_WINNT=0x0A00
+    )
+endif()
+
 if(UNIX AND NOT APPLE)
     target_link_libraries(retina_core PUBLIC pthread)
 endif()
